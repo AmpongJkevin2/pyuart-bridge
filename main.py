@@ -83,6 +83,23 @@ USB_TIMEOUT_MS = int(os.environ.get("BRIDGE_TIMEOUT_MS", 20))
 import ctypes
 import ctypes.util
 
+# ---------------------------------------------------------------------------
+# Termux library path fix
+# ---------------------------------------------------------------------------
+# On Android/Termux, Termux packages live in $PREFIX/lib, not /usr/lib.
+# Python's ctypes uses dlopen() which reads LD_LIBRARY_PATH at call-time via
+# getenv(), so updating os.environ here (before any CDLL call) is sufficient.
+# Without this, loading libusb-1.0.so fails with OSError because its own
+# transitive dependencies (other Termux libs) can't be found.
+_TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+_TERMUX_LIB = f"{_TERMUX_PREFIX}/lib"
+if os.path.isdir(_TERMUX_LIB):
+    _ld = os.environ.get("LD_LIBRARY_PATH", "")
+    if _TERMUX_LIB not in _ld.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"{_TERMUX_LIB}:{_ld}".strip(":")
+        # Use print here — logging isn't set up yet at import time
+        # (this block runs at module parse time before basicConfig is called)
+
 try:
     import usb.backend.libusb1 as _libusb1_mod
     import usb.core
@@ -95,30 +112,52 @@ except ImportError:
 # Candidate paths for libusb-1.0.so in Termux and common Linux layouts.
 # pyusb's default finder only searches /usr/lib, /lib, etc. — none of which
 # exist inside Termux's private data directory on Android.
-_TERMUX_PREFIX = "/data/data/com.termux/files/usr"
-_LIBUSB_SEARCH_PATHS = [
-    # Termux standard install path
-    f"{_TERMUX_PREFIX}/lib/libusb-1.0.so",
-    f"{_TERMUX_PREFIX}/lib/libusb-1.0.so.0",
-    f"{_TERMUX_PREFIX}/lib/libusb-1.0.so.0.3.0",
-    # proot-distro / chroot inside Termux
-    "/usr/lib/libusb-1.0.so",
-    "/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0",
-    "/usr/lib/arm-linux-gnueabihf/libusb-1.0.so.0",
-    "/usr/lib/x86_64-linux-gnu/libusb-1.0.so.0",
-]
+#
+# Priority order:
+#   1. BRIDGE_LIBUSB env var (user override, e.g. BRIDGE_LIBUSB=/path/to/libusb-1.0.so)
+#   2. $PREFIX/lib (Termux's package prefix, always set in Termux shell)
+#   3. Hardcoded Termux default path
+#   4. Standard Linux paths (proot-distro, WSL, desktop)
+#   5. ctypes.util.find_library (OS dynamic linker)
+
+_TERMUX_HARDCODED_PREFIX = "/data/data/com.termux/files/usr"
 
 
 def _find_libusb() -> str | None:
     """Return the first libusb-1.0 .so path that actually exists on this device."""
-    for path in _LIBUSB_SEARCH_PATHS:
-        if os.path.exists(path):
-            log.debug("_find_libusb: found %s", path)
-            return path
-    # Fall back to the OS dynamic linker search (works on plain Linux)
+    import glob
+
+    # Allow direct override — fastest path for debugging
+    override = os.environ.get("BRIDGE_LIBUSB")
+    if override:
+        log.debug("_find_libusb: using BRIDGE_LIBUSB override: %s", override)
+        return override
+
+    # Build candidate directories from both env and hardcoded fallback
+    prefix = os.environ.get("PREFIX", _TERMUX_HARDCODED_PREFIX)
+    candidate_dirs = [
+        f"{prefix}/lib",
+        _TERMUX_HARDCODED_PREFIX + "/lib",
+        "/usr/lib",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib/arm-linux-gnueabihf",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+        "/lib",
+    ]
+
+    # Prefer versioned names that are actual files (not broken symlinks)
+    for d in dict.fromkeys(candidate_dirs):  # deduplicate while preserving order
+        for pattern in ("libusb-1.0.so", "libusb-1.0.so.0", "libusb-1.0.so.0.*", "libusb-1.so"):
+            for hit in sorted(glob.glob(os.path.join(d, pattern))):
+                if os.path.exists(hit):  # resolves symlinks
+                    log.debug("_find_libusb: found %s", hit)
+                    return hit
+
+    # Fall back to the OS dynamic linker search (works on standard Linux)
     found = ctypes.util.find_library("usb-1.0") or ctypes.util.find_library("usb")
     if found:
-        log.debug("_find_libusb: found via system: %s", found)
+        log.debug("_find_libusb: found via system linker: %s", found)
     return found
 
 
@@ -133,8 +172,6 @@ def _device_from_fd(fd: int):
     try c_int first (32-bit, common on armv7) and fall back to c_int64 (64-bit
     AArch64 / x86_64) if the first attempt fails.
     """
-    import ctypes
-
     log.debug("_device_from_fd: fd=%d", fd)
 
     libusb_path = _find_libusb()
@@ -144,15 +181,40 @@ def _device_from_fd(fd: int):
         )
     log.debug("_device_from_fd: using libusb at %s", libusb_path)
 
-    backend = _libusb1_mod.get_backend(find_library=lambda _: libusb_path)
+    # Ensure $PREFIX/lib is in LD_LIBRARY_PATH so libusb can load its own
+    # dependencies.  dlopen() reads LD_LIBRARY_PATH at call-time via getenv().
+    lib_dir = os.path.dirname(os.path.abspath(libusb_path))
+    _ld = os.environ.get("LD_LIBRARY_PATH", "")
+    if lib_dir not in _ld.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{_ld}".strip(":")
+        log.debug("_device_from_fd: updated LD_LIBRARY_PATH to include %s", lib_dir)
+
+    # Pre-load libusb with RTLD_GLOBAL so its symbols are globally visible.
+    # This ensures pyusb's internal ctypes.CDLL() call reuses the cached handle
+    # instead of re-loading from scratch (which might fail without LD_LIBRARY_PATH).
+    try:
+        ctypes.CDLL(libusb_path, mode=ctypes.RTLD_GLOBAL)
+        log.debug("_device_from_fd: pre-loaded %s OK", libusb_path)
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot load libusb from {libusb_path}: {e}\n"
+            f"Try running with:  LD_LIBRARY_PATH={lib_dir} termux-usb -r -e ./main.py <device>"
+        ) from e
+
+    import usb.backend.libusb1 as _libusb1_mod
+    import usb.core
+    import usb.util
+
+    backend = _libusb1_mod.get_backend()
     if backend is None:
         raise RuntimeError(
-            f"pyusb could not load libusb from {libusb_path}.  "
-            "Try:  LD_LIBRARY_PATH=$PREFIX/lib termux-usb -r -e ./main.py <device>"
+            f"pyusb could not initialize backend from {libusb_path}. "
+            "Please report this with the output of: "
+            f"python -c \"import ctypes; ctypes.CDLL('{libusb_path}')\""
         )
     lib = backend.lib
     ctx = backend.ctx
-    log.debug("_device_from_fd: got backend, ctx=%s", ctx)
+    log.debug("_device_from_fd: got backend OK")
 
     # libusb_wrap_sys_device signature —
     #   (libusb_context*, intptr_t sys_dev, libusb_device_handle**) -> int
