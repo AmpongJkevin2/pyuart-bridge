@@ -63,7 +63,7 @@ from typing import Optional
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if os.environ.get("BRIDGE_DEBUG") else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -95,23 +95,49 @@ def _device_from_fd(fd: int):
 
     Calls libusb_wrap_sys_device() — the official libusb API for exactly this
     Android/Termux use-case.  Technique ported from Querela/termux-usb-python.
+
+    libusb's sys_device argument is intptr_t (platform-dependent width).  We
+    try c_int first (32-bit, common on armv7) and fall back to c_int64 (64-bit
+    AArch64 / x86_64) if the first attempt fails.
     """
+    import ctypes
+
+    log.debug("_device_from_fd: fd=%d", fd)
     backend = _libusb1_mod.get_backend()
+    if backend is None:
+        raise RuntimeError(
+            "libusb backend not found.  Is libusb installed?  "
+            "Run:  pkg install libusb"
+        )
     lib = backend.lib
     ctx = backend.ctx
+    log.debug("_device_from_fd: got backend, ctx=%s", ctx)
 
-    # Extend ctypes wrapper with Android-specific symbols
-    lib.libusb_wrap_sys_device.argtypes = [
-        _libusb1_mod.c_void_p,
-        _libusb1_mod.c_int,
-        _libusb1_mod.POINTER(_libusb1_mod._libusb_device_handle),
-    ]
-    lib.libusb_get_device.argtypes = [_libusb1_mod.c_void_p]
-    lib.libusb_get_device.restype = _libusb1_mod._libusb_device_handle
+    # libusb_wrap_sys_device signature —
+    #   (libusb_context*, intptr_t sys_dev, libusb_device_handle**) -> int
+    # intptr_t is c_int on 32-bit ARM, c_int64 on AArch64.
+    # We try both; the first one that doesn't segfault/error wins.
+    lib.libusb_get_device.argtypes = [ctypes.c_void_p]
+    lib.libusb_get_device.restype = ctypes.c_void_p
 
     handle = _libusb1_mod._libusb_device_handle()
-    _libusb1_mod._check(lib.libusb_wrap_sys_device(ctx, int(fd), _libusb1_mod.byref(handle)))
+
+    for fd_type in (ctypes.c_int, ctypes.c_int64):
+        lib.libusb_wrap_sys_device.argtypes = [
+            ctypes.c_void_p,
+            fd_type,
+            ctypes.POINTER(_libusb1_mod._libusb_device_handle),
+        ]
+        log.debug("_device_from_fd: trying libusb_wrap_sys_device with fd_type=%s", fd_type.__name__)
+        rc = lib.libusb_wrap_sys_device(ctx, fd_type(fd), _libusb1_mod.byref(handle))
+        log.debug("_device_from_fd: libusb_wrap_sys_device returned %d", rc)
+        if rc == 0:
+            break
+    else:
+        raise RuntimeError(f"libusb_wrap_sys_device failed with rc={rc} for fd={fd}")
+
     devid = lib.libusb_get_device(handle)
+    log.debug("_device_from_fd: devid=%s", devid)
 
     class _DummyDev:
         def __init__(self, d, h):
@@ -121,6 +147,7 @@ def _device_from_fd(fd: int):
     dummy = _DummyDev(devid, handle)
     device = usb.core.Device(dummy, backend)
     device._ctx.handle = dummy
+    log.debug("_device_from_fd: pyusb Device created OK")
     return device
 
 
@@ -191,9 +218,14 @@ class CP210xSerial(_BaseSerial):
         try:
             if self._dev.is_kernel_driver_active(0):
                 self._dev.detach_kernel_driver(0)
-        except Exception:
-            pass
-        self._dev.set_configuration()
+        except Exception as e:
+            log.debug("detach_kernel_driver skipped: %s", e)
+        # Android already sets the configuration; calling set_configuration()
+        # again returns LIBUSB_ERROR_NO_DEVICE — catch and continue.
+        try:
+            self._dev.set_configuration()
+        except Exception as e:
+            log.debug("set_configuration skipped (Android already configured): %s", e)
 
         # Enable UART
         self._ctrl(self._REQ_H2D, self._IFC_ENABLE, self._UART_ENABLE)
@@ -252,9 +284,12 @@ class CH34xSerial(_BaseSerial):
         try:
             if self._dev.is_kernel_driver_active(0):
                 self._dev.detach_kernel_driver(0)
-        except Exception:
-            pass
-        self._dev.set_configuration()
+        except Exception as e:
+            log.debug("detach_kernel_driver skipped: %s", e)
+        try:
+            self._dev.set_configuration()
+        except Exception as e:
+            log.debug("set_configuration skipped (Android already configured): %s", e)
 
         # Serial init
         self._ctrl_write(self._CMD_SERIAL_INIT, 0, 0)
@@ -303,9 +338,12 @@ class FTDISerial(_BaseSerial):
         try:
             if self._dev.is_kernel_driver_active(0):
                 self._dev.detach_kernel_driver(0)
-        except Exception:
-            pass
-        self._dev.set_configuration()
+        except Exception as e:
+            log.debug("detach_kernel_driver skipped: %s", e)
+        try:
+            self._dev.set_configuration()
+        except Exception as e:
+            log.debug("set_configuration skipped (Android already configured): %s", e)
 
         self._ctrl(self._CMD_RESET, self._RESET_SIO)
         self._ctrl(self._CMD_SET_BAUDRATE, self._baud_divisor(self._baud))

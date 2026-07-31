@@ -8,3 +8,4 @@ wheels/
 
 # Virtual environments
 .venv
+./Building TCPUART app with DFU support for Android 15.md
