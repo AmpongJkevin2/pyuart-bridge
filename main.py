@@ -201,11 +201,11 @@ def _device_from_fd(fd: int):
             f"Try running with:  LD_LIBRARY_PATH={lib_dir} termux-usb -r -e ./main.py <device>"
         ) from e
 
-    import usb.backend.libusb1 as _libusb1_mod
-    import usb.core
-    import usb.util
-
-    backend = _libusb1_mod.get_backend()
+    # get_backend() without find_library calls ctypes.util.find_library("usb-1.0")
+    # which returns None on Termux (no ldconfig, non-standard paths).
+    # Pass our resolved path directly; dlopen reuses the handle already cached
+    # by the RTLD_GLOBAL pre-load above, so this is effectively free.
+    backend = _libusb1_mod.get_backend(find_library=lambda _: libusb_path)
     if backend is None:
         raise RuntimeError(
             f"pyusb could not initialize backend from {libusb_path}. "
