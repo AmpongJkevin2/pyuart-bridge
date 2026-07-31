@@ -80,6 +80,9 @@ USB_TIMEOUT_MS = int(os.environ.get("BRIDGE_TIMEOUT_MS", 20))
 # ---------------------------------------------------------------------------
 # libusb / pyusb helpers
 # ---------------------------------------------------------------------------
+import ctypes
+import ctypes.util
+
 try:
     import usb.backend.libusb1 as _libusb1_mod
     import usb.core
@@ -87,6 +90,36 @@ try:
 except ImportError:
     log.error("pyusb not found.  Install with:  pip install pyusb")
     sys.exit(1)
+
+
+# Candidate paths for libusb-1.0.so in Termux and common Linux layouts.
+# pyusb's default finder only searches /usr/lib, /lib, etc. — none of which
+# exist inside Termux's private data directory on Android.
+_TERMUX_PREFIX = "/data/data/com.termux/files/usr"
+_LIBUSB_SEARCH_PATHS = [
+    # Termux standard install path
+    f"{_TERMUX_PREFIX}/lib/libusb-1.0.so",
+    f"{_TERMUX_PREFIX}/lib/libusb-1.0.so.0",
+    f"{_TERMUX_PREFIX}/lib/libusb-1.0.so.0.3.0",
+    # proot-distro / chroot inside Termux
+    "/usr/lib/libusb-1.0.so",
+    "/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0",
+    "/usr/lib/arm-linux-gnueabihf/libusb-1.0.so.0",
+    "/usr/lib/x86_64-linux-gnu/libusb-1.0.so.0",
+]
+
+
+def _find_libusb() -> str | None:
+    """Return the first libusb-1.0 .so path that actually exists on this device."""
+    for path in _LIBUSB_SEARCH_PATHS:
+        if os.path.exists(path):
+            log.debug("_find_libusb: found %s", path)
+            return path
+    # Fall back to the OS dynamic linker search (works on plain Linux)
+    found = ctypes.util.find_library("usb-1.0") or ctypes.util.find_library("usb")
+    if found:
+        log.debug("_find_libusb: found via system: %s", found)
+    return found
 
 
 def _device_from_fd(fd: int):
@@ -103,11 +136,19 @@ def _device_from_fd(fd: int):
     import ctypes
 
     log.debug("_device_from_fd: fd=%d", fd)
-    backend = _libusb1_mod.get_backend()
+
+    libusb_path = _find_libusb()
+    if libusb_path is None:
+        raise RuntimeError(
+            "libusb-1.0.so not found.  In Termux run:  pkg install libusb"
+        )
+    log.debug("_device_from_fd: using libusb at %s", libusb_path)
+
+    backend = _libusb1_mod.get_backend(find_library=lambda _: libusb_path)
     if backend is None:
         raise RuntimeError(
-            "libusb backend not found.  Is libusb installed?  "
-            "Run:  pkg install libusb"
+            f"pyusb could not load libusb from {libusb_path}.  "
+            "Try:  LD_LIBRARY_PATH=$PREFIX/lib termux-usb -r -e ./main.py <device>"
         )
     lib = backend.lib
     ctx = backend.ctx
