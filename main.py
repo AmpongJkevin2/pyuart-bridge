@@ -78,66 +78,42 @@ BRIDGE_BAUD = int(os.environ.get("BRIDGE_BAUD", 115200))
 USB_TIMEOUT_MS = int(os.environ.get("BRIDGE_TIMEOUT_MS", 20))
 
 # ---------------------------------------------------------------------------
-# libusb / pyusb helpers
+# libusb helpers — pure ctypes, no pyusb
 # ---------------------------------------------------------------------------
+# pyusb's get_backend() internally calls libusb_init() via _LibUSBContext,
+# which fails on Android/Termux because enumerating /dev/bus/usb requires root.
+# pyusb swallows that exception and returns None.
+#
+# Solution: bypass pyusb entirely.  We load libusb-1.0.so directly with
+# ctypes and call only the 11 functions we actually need.  libusb_wrap_sys_device()
+# with ctx=NULL skips all device enumeration — it just wraps the fd that
+# termux-usb already opened for us.
+
 import ctypes
 import ctypes.util
+import glob
 
-# ---------------------------------------------------------------------------
-# Termux library path fix
-# ---------------------------------------------------------------------------
-# On Android/Termux, Termux packages live in $PREFIX/lib, not /usr/lib.
-# Python's ctypes uses dlopen() which reads LD_LIBRARY_PATH at call-time via
-# getenv(), so updating os.environ here (before any CDLL call) is sufficient.
-# Without this, loading libusb-1.0.so fails with OSError because its own
-# transitive dependencies (other Termux libs) can't be found.
+# Ensure $PREFIX/lib is in LD_LIBRARY_PATH so libusb's own transitive deps
+# (other Termux packages) can be resolved by dlopen().
 _TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
-_TERMUX_LIB = f"{_TERMUX_PREFIX}/lib"
+_TERMUX_LIB    = f"{_TERMUX_PREFIX}/lib"
 if os.path.isdir(_TERMUX_LIB):
     _ld = os.environ.get("LD_LIBRARY_PATH", "")
     if _TERMUX_LIB not in _ld.split(":"):
         os.environ["LD_LIBRARY_PATH"] = f"{_TERMUX_LIB}:{_ld}".strip(":")
-        # Use print here — logging isn't set up yet at import time
-        # (this block runs at module parse time before basicConfig is called)
-
-try:
-    import usb.backend.libusb1 as _libusb1_mod
-    import usb.core
-    import usb.util
-except ImportError:
-    log.error("pyusb not found.  Install with:  pip install pyusb")
-    sys.exit(1)
-
-
-# Candidate paths for libusb-1.0.so in Termux and common Linux layouts.
-# pyusb's default finder only searches /usr/lib, /lib, etc. — none of which
-# exist inside Termux's private data directory on Android.
-#
-# Priority order:
-#   1. BRIDGE_LIBUSB env var (user override, e.g. BRIDGE_LIBUSB=/path/to/libusb-1.0.so)
-#   2. $PREFIX/lib (Termux's package prefix, always set in Termux shell)
-#   3. Hardcoded Termux default path
-#   4. Standard Linux paths (proot-distro, WSL, desktop)
-#   5. ctypes.util.find_library (OS dynamic linker)
-
-_TERMUX_HARDCODED_PREFIX = "/data/data/com.termux/files/usr"
 
 
 def _find_libusb() -> str | None:
-    """Return the first libusb-1.0 .so path that actually exists on this device."""
-    import glob
-
-    # Allow direct override — fastest path for debugging
+    """Return the absolute path of libusb-1.0.so on this device."""
     override = os.environ.get("BRIDGE_LIBUSB")
     if override:
-        log.debug("_find_libusb: using BRIDGE_LIBUSB override: %s", override)
+        log.debug("_find_libusb: BRIDGE_LIBUSB override → %s", override)
         return override
 
-    # Build candidate directories from both env and hardcoded fallback
-    prefix = os.environ.get("PREFIX", _TERMUX_HARDCODED_PREFIX)
-    candidate_dirs = [
+    prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+    dirs = [
         f"{prefix}/lib",
-        _TERMUX_HARDCODED_PREFIX + "/lib",
+        "/data/data/com.termux/files/usr/lib",
         "/usr/lib",
         "/usr/lib/aarch64-linux-gnu",
         "/usr/lib/arm-linux-gnueabihf",
@@ -145,113 +121,232 @@ def _find_libusb() -> str | None:
         "/usr/local/lib",
         "/lib",
     ]
-
-    # Prefer versioned names that are actual files (not broken symlinks)
-    for d in dict.fromkeys(candidate_dirs):  # deduplicate while preserving order
-        for pattern in ("libusb-1.0.so", "libusb-1.0.so.0", "libusb-1.0.so.0.*", "libusb-1.so"):
-            for hit in sorted(glob.glob(os.path.join(d, pattern))):
-                if os.path.exists(hit):  # resolves symlinks
+    patterns = ("libusb-1.0.so", "libusb-1.0.so.0", "libusb-1.0.so.0.*", "libusb-1.so")
+    for d in dict.fromkeys(dirs):
+        for pat in patterns:
+            for hit in sorted(glob.glob(os.path.join(d, pat))):
+                if os.path.exists(hit):
                     log.debug("_find_libusb: found %s", hit)
                     return hit
-
-    # Fall back to the OS dynamic linker search (works on standard Linux)
     found = ctypes.util.find_library("usb-1.0") or ctypes.util.find_library("usb")
     if found:
-        log.debug("_find_libusb: found via system linker: %s", found)
+        log.debug("_find_libusb: system linker found %s", found)
     return found
 
 
-def _device_from_fd(fd: int):
+# ---- ctypes descriptor structure ------------------------------------------
+
+class _LibUSBDescriptor(ctypes.Structure):
+    """libusb_device_descriptor — stable ABI for all libusb 1.0.x."""
+    _fields_ = [
+        ("bLength",            ctypes.c_uint8),
+        ("bDescriptorType",    ctypes.c_uint8),
+        ("bcdUSB",             ctypes.c_uint16),
+        ("bDeviceClass",       ctypes.c_uint8),
+        ("bDeviceSubClass",    ctypes.c_uint8),
+        ("bDeviceProtocol",    ctypes.c_uint8),
+        ("bMaxPacketSize0",    ctypes.c_uint8),
+        ("idVendor",           ctypes.c_uint16),
+        ("idProduct",          ctypes.c_uint16),
+        ("bcdDevice",          ctypes.c_uint16),
+        ("iManufacturer",      ctypes.c_uint8),
+        ("iProduct",           ctypes.c_uint8),
+        ("iSerialNumber",      ctypes.c_uint8),
+        ("bNumConfigurations", ctypes.c_uint8),
+    ]
+
+
+def _setup_libusb_prototypes(lib: ctypes.CDLL) -> None:
+    """Declare ctypes argtypes/restype for the libusb functions we call."""
+    vp  = ctypes.c_void_p
+    pvp = ctypes.POINTER(ctypes.c_void_p)
+    i   = ctypes.c_int
+    u8  = ctypes.c_uint8
+    u16 = ctypes.c_uint16
+    u32 = ctypes.c_uint
+    pi  = ctypes.POINTER(ctypes.c_int)
+    cp  = ctypes.c_char_p
+
+    lib.libusb_wrap_sys_device.restype  = i   # set argtypes per call (fd width varies)
+    lib.libusb_get_device.restype       = vp;  lib.libusb_get_device.argtypes       = [vp]
+    lib.libusb_get_device_descriptor.restype  = i;  lib.libusb_get_device_descriptor.argtypes  = [vp, vp]
+    lib.libusb_get_string_descriptor_ascii.restype  = i;  lib.libusb_get_string_descriptor_ascii.argtypes = [vp, u8, cp, i]
+    lib.libusb_claim_interface.restype  = i;   lib.libusb_claim_interface.argtypes  = [vp, i]
+    lib.libusb_release_interface.restype = i;  lib.libusb_release_interface.argtypes = [vp, i]
+    lib.libusb_kernel_driver_active.restype  = i;  lib.libusb_kernel_driver_active.argtypes  = [vp, i]
+    lib.libusb_detach_kernel_driver.restype  = i;  lib.libusb_detach_kernel_driver.argtypes  = [vp, i]
+    lib.libusb_set_configuration.restype     = i;  lib.libusb_set_configuration.argtypes     = [vp, i]
+    lib.libusb_bulk_transfer.restype    = i;   lib.libusb_bulk_transfer.argtypes    = [vp, u8, cp, i, pi, u32]
+    lib.libusb_control_transfer.restype = i;   lib.libusb_control_transfer.argtypes = [vp, u8, u8, u16, u16, cp, u16, u32]
+    lib.libusb_close.restype = None;           lib.libusb_close.argtypes = [vp]
+
+
+# ---- RawUSBDevice ---------------------------------------------------------
+
+class RawUSBDevice:
     """
-    Wrap an Android file descriptor (from $TERMUX_USB_FD) into a pyusb Device.
+    Thin ctypes wrapper around a libusb_device_handle.
+    Presents the same interface _BaseSerial subclasses use so they don't
+    need to know whether we're going through pyusb or raw ctypes.
+    """
 
-    Calls libusb_wrap_sys_device() — the official libusb API for exactly this
-    Android/Termux use-case.  Technique ported from Querela/termux-usb-python.
+    LIBUSB_SUCCESS       =  0
+    LIBUSB_ERROR_TIMEOUT = -7
 
-    libusb's sys_device argument is intptr_t (platform-dependent width).  We
-    try c_int first (32-bit, common on armv7) and fall back to c_int64 (64-bit
-    AArch64 / x86_64) if the first attempt fails.
+    def __init__(self, lib: ctypes.CDLL, handle, desc: _LibUSBDescriptor):
+        self._lib    = lib
+        self._handle = handle   # c_void_p
+        self._desc   = desc
+
+    # ---- descriptor properties ------------------------------------------------
+
+    @property
+    def idVendor(self) -> int:   return self._desc.idVendor
+    @property
+    def idProduct(self) -> int:  return self._desc.idProduct
+    @property
+    def manufacturer(self) -> str: return self._get_string(self._desc.iManufacturer)
+    @property
+    def product(self) -> str:      return self._get_string(self._desc.iProduct)
+
+    def _get_string(self, index: int) -> str:
+        if not self._handle or index == 0:
+            return ""
+        buf = ctypes.create_string_buffer(256)
+        rc  = self._lib.libusb_get_string_descriptor_ascii(
+            self._handle, ctypes.c_uint8(index), buf, 256
+        )
+        return buf.value.decode("utf-8", errors="replace") if rc > 0 else ""
+
+    # ---- pyusb-compatible interface -------------------------------------------
+
+    def is_kernel_driver_active(self, interface: int) -> bool:
+        return self._lib.libusb_kernel_driver_active(self._handle, interface) == 1
+
+    def detach_kernel_driver(self, interface: int) -> None:
+        self._lib.libusb_detach_kernel_driver(self._handle, interface)
+
+    def set_configuration(self, configuration: int = 1) -> None:
+        self._lib.libusb_set_configuration(self._handle, configuration)
+
+    def ctrl_transfer(self, bmRequestType: int, bRequest: int,
+                      wValue: int = 0, wIndex: int = 0,
+                      data_or_wLength=None, timeout: int = 1000):
+        if data_or_wLength is None or data_or_wLength == 0:
+            buf, length = None, 0
+        elif isinstance(data_or_wLength, int):
+            buf    = ctypes.create_string_buffer(data_or_wLength)
+            length = data_or_wLength
+        else:
+            raw    = bytes(data_or_wLength)
+            buf    = ctypes.create_string_buffer(raw, len(raw))
+            length = len(raw)
+
+        rc = self._lib.libusb_control_transfer(
+            self._handle,
+            ctypes.c_uint8(bmRequestType),  ctypes.c_uint8(bRequest),
+            ctypes.c_uint16(wValue),        ctypes.c_uint16(wIndex),
+            buf, ctypes.c_uint16(length),   ctypes.c_uint(timeout),
+        )
+        if rc < 0:
+            log.debug("ctrl_transfer rc=%d (bmRT=0x%02X req=0x%02X val=0x%04X idx=0x%04X)",
+                      rc, bmRequestType, bRequest, wValue, wIndex)
+            return None
+        if isinstance(data_or_wLength, int) and data_or_wLength > 0 and buf is not None:
+            return buf.raw[:rc]
+        return rc
+
+    def read(self, endpoint: int, size: int, timeout: int = 20) -> bytes:
+        buf         = ctypes.create_string_buffer(size)
+        transferred = ctypes.c_int(0)
+        rc = self._lib.libusb_bulk_transfer(
+            self._handle, ctypes.c_uint8(endpoint),
+            buf, ctypes.c_int(size), ctypes.byref(transferred), ctypes.c_uint(timeout),
+        )
+        return buf.raw[:transferred.value] if rc in (self.LIBUSB_SUCCESS, self.LIBUSB_ERROR_TIMEOUT) else b""
+
+    def write(self, endpoint: int, data: bytes, timeout: int = 1000) -> int:
+        raw         = bytes(data)
+        buf         = ctypes.create_string_buffer(raw, len(raw))
+        transferred = ctypes.c_int(0)
+        rc = self._lib.libusb_bulk_transfer(
+            self._handle, ctypes.c_uint8(endpoint),
+            buf, ctypes.c_int(len(raw)), ctypes.byref(transferred), ctypes.c_uint(timeout),
+        )
+        return transferred.value if rc == self.LIBUSB_SUCCESS else 0
+
+    def close(self) -> None:
+        if self._handle:
+            try:
+                self._lib.libusb_release_interface(self._handle, 0)
+            except Exception:
+                pass
+            self._lib.libusb_close(self._handle)
+            self._handle = None
+
+
+def _device_from_fd(fd: int) -> RawUSBDevice:
+    """
+    Wrap a termux-usb file descriptor into a RawUSBDevice using direct ctypes.
+
+    ctx=NULL in libusb_wrap_sys_device() is intentional: it skips libusb_init()
+    and device enumeration entirely (both fail on Android without root).
+    libusb >= 1.0.23 supports NULL context for this call.
     """
     log.debug("_device_from_fd: fd=%d", fd)
 
     libusb_path = _find_libusb()
     if libusb_path is None:
-        raise RuntimeError(
-            "libusb-1.0.so not found.  In Termux run:  pkg install libusb"
-        )
-    log.debug("_device_from_fd: using libusb at %s", libusb_path)
+        raise RuntimeError("libusb-1.0.so not found.  Run:  pkg install libusb")
+    log.debug("_device_from_fd: loading %s", libusb_path)
 
-    # Ensure $PREFIX/lib is in LD_LIBRARY_PATH so libusb can load its own
-    # dependencies.  dlopen() reads LD_LIBRARY_PATH at call-time via getenv().
+    # Ensure $PREFIX/lib is in LD_LIBRARY_PATH for transitive deps
     lib_dir = os.path.dirname(os.path.abspath(libusb_path))
     _ld = os.environ.get("LD_LIBRARY_PATH", "")
     if lib_dir not in _ld.split(":"):
         os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{_ld}".strip(":")
-        log.debug("_device_from_fd: updated LD_LIBRARY_PATH to include %s", lib_dir)
 
-    # Pre-load libusb with RTLD_GLOBAL so its symbols are globally visible.
-    # This ensures pyusb's internal ctypes.CDLL() call reuses the cached handle
-    # instead of re-loading from scratch (which might fail without LD_LIBRARY_PATH).
     try:
-        ctypes.CDLL(libusb_path, mode=ctypes.RTLD_GLOBAL)
-        log.debug("_device_from_fd: pre-loaded %s OK", libusb_path)
+        lib = ctypes.CDLL(libusb_path)
     except OSError as e:
         raise RuntimeError(
-            f"Cannot load libusb from {libusb_path}: {e}\n"
-            f"Try running with:  LD_LIBRARY_PATH={lib_dir} termux-usb -r -e ./main.py <device>"
+            f"Cannot load {libusb_path}: {e}\n"
+            f"Try:  LD_LIBRARY_PATH={lib_dir} termux-usb -r -e ./main.py <device>"
         ) from e
 
-    # get_backend() without find_library calls ctypes.util.find_library("usb-1.0")
-    # which returns None on Termux (no ldconfig, non-standard paths).
-    # Pass our resolved path directly; dlopen reuses the handle already cached
-    # by the RTLD_GLOBAL pre-load above, so this is effectively free.
-    backend = _libusb1_mod.get_backend(find_library=lambda _: libusb_path)
-    if backend is None:
-        raise RuntimeError(
-            f"pyusb could not initialize backend from {libusb_path}. "
-            "Please report this with the output of: "
-            f"python -c \"import ctypes; ctypes.CDLL('{libusb_path}')\""
-        )
-    lib = backend.lib
-    ctx = backend.ctx
-    log.debug("_device_from_fd: got backend OK")
+    _setup_libusb_prototypes(lib)
+    log.debug("_device_from_fd: libusb loaded OK")
 
-    # libusb_wrap_sys_device signature —
-    #   (libusb_context*, intptr_t sys_dev, libusb_device_handle**) -> int
-    # intptr_t is c_int on 32-bit ARM, c_int64 on AArch64.
-    # We try both; the first one that doesn't segfault/error wins.
-    lib.libusb_get_device.argtypes = [ctypes.c_void_p]
-    lib.libusb_get_device.restype = ctypes.c_void_p
-
-    handle = _libusb1_mod._libusb_device_handle()
-
-    for fd_type in (ctypes.c_int, ctypes.c_int64):
+    # Wrap Android fd — NULL context skips libusb_init() which fails on Android
+    handle = ctypes.c_void_p()
+    rc     = -1
+    for fd_ctype in (ctypes.c_int64, ctypes.c_int):
         lib.libusb_wrap_sys_device.argtypes = [
             ctypes.c_void_p,
-            fd_type,
-            ctypes.POINTER(_libusb1_mod._libusb_device_handle),
+            fd_ctype,
+            ctypes.POINTER(ctypes.c_void_p),
         ]
-        log.debug("_device_from_fd: trying libusb_wrap_sys_device with fd_type=%s", fd_type.__name__)
-        rc = lib.libusb_wrap_sys_device(ctx, fd_type(fd), _libusb1_mod.byref(handle))
-        log.debug("_device_from_fd: libusb_wrap_sys_device returned %d", rc)
+        rc = lib.libusb_wrap_sys_device(None, fd_ctype(fd), ctypes.byref(handle))
+        log.debug("libusb_wrap_sys_device(ctx=NULL, %s) → %d", fd_ctype.__name__, rc)
         if rc == 0:
             break
-    else:
-        raise RuntimeError(f"libusb_wrap_sys_device failed with rc={rc} for fd={fd}")
 
-    devid = lib.libusb_get_device(handle)
-    log.debug("_device_from_fd: devid=%s", devid)
+    if rc != 0:
+        raise RuntimeError(f"libusb_wrap_sys_device failed: rc={rc} (fd={fd})")
 
-    class _DummyDev:
-        def __init__(self, d, h):
-            self.devid = d
-            self.handle = h
+    log.debug("_device_from_fd: handle=%s", handle)
 
-    dummy = _DummyDev(devid, handle)
-    device = usb.core.Device(dummy, backend)
-    device._ctx.handle = dummy
-    log.debug("_device_from_fd: pyusb Device created OK")
-    return device
+    device = lib.libusb_get_device(handle)
+    desc   = _LibUSBDescriptor()
+    lib.libusb_get_device_descriptor(device, ctypes.byref(desc))
+    log.debug("_device_from_fd: VID=%04X PID=%04X", desc.idVendor, desc.idProduct)
+
+    # Claim interface 0 so bulk transfers work.
+    # Android may already hold the interface (rc=-6 BUSY) — still fine for I/O.
+    rc_claim = lib.libusb_claim_interface(handle, 0)
+    log.debug("libusb_claim_interface(0) → %d (0=OK, -6=BUSY is also OK)", rc_claim)
+
+    return RawUSBDevice(lib, handle, desc)
 
 
 # ---------------------------------------------------------------------------
